@@ -1,0 +1,129 @@
+name: Temporary apply WS cleanup
+
+on:
+  push:
+    branches:
+      - tmp/apply-ws-nonstream-cleanup-2
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/apply-ws-nonstream-cleanup-2
+
+      - name: Apply focused patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("src/agents/models/openai_responses.py")
+          text = source_path.read_text(encoding="utf-8")
+          old = '''        final_response: Response | None = None
+          terminal_event_type: str | None = None
+          async for event in self._iter_websocket_response_events(create_kwargs):
+              event_type = getattr(event, "type", None)
+              if isinstance(event, ResponseCompletedEvent):
+                  final_response = event.response
+                  terminal_event_type = event.type
+              elif event_type in {"response.incomplete", "response.failed"}:
+                  terminal_event_type = cast(str, event_type)
+                  terminal_response = getattr(event, "response", None)
+                  raise response_terminal_failure_error(
+                      terminal_event_type,
+                      terminal_response if isinstance(terminal_response, Response) else None,
+                  )
+          '''
+          new = '''        final_response: Response | None = None
+          terminal_event_type: str | None = None
+          response_events = self._iter_websocket_response_events(create_kwargs)
+          async with contextlib.aclosing(response_events):
+              async for event in response_events:
+                  event_type = getattr(event, "type", None)
+                  if isinstance(event, ResponseCompletedEvent):
+                      final_response = event.response
+                      terminal_event_type = event.type
+                  elif event_type in {"response.incomplete", "response.failed"}:
+                      terminal_event_type = cast(str, event_type)
+                      terminal_response = getattr(event, "response", None)
+                      raise response_terminal_failure_error(
+                          terminal_event_type,
+                          terminal_response if isinstance(terminal_response, Response) else None,
+                      )
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one target block, found {text.count(old)}")
+          source_path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          test_path = Path("tests/models/test_openai_responses_ws_nonstream_cleanup.py")
+          test_path.write_text('''from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from openai import AsyncOpenAI
+
+from agents import ModelSettings
+from agents.exceptions import ModelBehaviorError
+from agents.models.openai_responses import OpenAIResponsesWSModel
+
+
+class _RetainedTerminalStream:
+    def __init__(self, event_type: str) -> None:
+        self.closed = False
+        self._event_type = event_type
+        self._yielded = False
+
+    def __aiter__(self) -> _RetainedTerminalStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._yielded:
+            raise StopAsyncIteration
+        self._yielded = True
+        return SimpleNamespace(type=self._event_type, response=None)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["response.failed", "response.incomplete"])
+async def test_nonstream_websocket_terminal_failure_closes_event_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    model = OpenAIResponsesWSModel("gpt-4.1", AsyncOpenAI(api_key="test"))
+    stream = _RetainedTerminalStream(event_type)
+    monkeypatch.setattr(model, "_iter_websocket_response_events", lambda _kwargs: stream)
+
+    with pytest.raises(ModelBehaviorError, match=event_type):
+        await model._fetch_response(
+            system_instructions=None,
+            input=[],
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            stream=False,
+        )
+
+    assert stream.closed
+''', encoding="utf-8")
+
+          Path(".github/workflows/tmp-apply-ws-cleanup.yml").unlink()
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(models): close non-streaming websocket iterator"
+          git push origin HEAD:tmp/apply-ws-nonstream-cleanup-2
