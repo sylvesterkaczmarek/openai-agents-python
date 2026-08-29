@@ -28,7 +28,7 @@ class FuncSchema:
     name: str
     """The name of the function."""
     description: str | None
-    """The description of the function."""
+    """The description of the function, derived from the docstring."""
     params_pydantic_model: type[BaseModel]
     """A Pydantic model that represents the function's parameters."""
     params_json_schema: dict[str, Any]
@@ -241,6 +241,36 @@ def _ensure_blank_line_before_google_sections(doc: str) -> str:
     return "\n".join(output)
 
 
+def _remove_blank_line_after_google_sections(doc: str) -> str:
+    """Remove one blank line below a Google-style parameter section title.
+
+    Griffe skips a recognized section when its title is followed by one blank line and then
+    an indented body, reporting ``Extraneous blank line below section title``. Normalize only
+    the parameter-section aliases consumed by ``generate_func_documentation``; unrelated Google
+    sections and already well-formed docstrings are left unchanged.
+    """
+    lines = doc.splitlines()
+    output: list[str] = []
+    removed = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        output.append(line)
+        if (
+            _GOOGLE_SECTION_HEADER_RE.match(line)
+            and index + 2 < len(lines)
+            and not lines[index + 1].strip()
+            and lines[index + 2].startswith((" ", "\t"))
+        ):
+            index += 1
+            removed = True
+        index += 1
+
+    if not removed:
+        return doc
+    return "\n".join(output)
+
+
 def generate_func_documentation(
     func: Callable[..., Any], style: DocstringStyle | None = None
 ) -> FuncDocumentation:
@@ -265,6 +295,7 @@ def generate_func_documentation(
     resolved_style = style or _detect_docstring_style(doc)
     if resolved_style == "google":
         doc = _ensure_blank_line_before_google_sections(doc)
+        doc = _remove_blank_line_after_google_sections(doc)
 
     with _suppress_griffe_logging():
         docstring = Docstring(doc, lineno=1, parser=resolved_style)
