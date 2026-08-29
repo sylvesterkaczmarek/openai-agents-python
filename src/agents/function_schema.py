@@ -28,7 +28,7 @@ class FuncSchema:
     name: str
     """The name of the function."""
     description: str | None
-    """The description of the function, derived from the docstring."""
+    """The description of the function."""
     params_pydantic_model: type[BaseModel]
     """A Pydantic model that represents the function's parameters."""
     params_json_schema: dict[str, Any]
