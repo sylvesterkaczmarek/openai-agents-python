@@ -1,0 +1,99 @@
+name: Temporary Google docstring patch
+
+on:
+  push:
+    branches:
+      - fix/google-docstring-blank-line-below-args
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    if: github.actor == 'sylvesterkaczmarek'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Apply focused patch
+        shell: python
+        run: |
+          from pathlib import Path
+
+          source_path = Path("src/agents/function_schema.py")
+          source = source_path.read_text()
+
+          marker = '''    if not inserted:\n        # Preserve the original object (splitlines/join would drop a trailing newline).\n        return doc\n    return "\\n".join(output)\n\n\ndef generate_func_documentation(\n'''
+          helper = '''    if not inserted:\n        # Preserve the original object (splitlines/join would drop a trailing newline).\n        return doc\n    return "\\n".join(output)\n\n\ndef _remove_blank_line_after_google_sections(doc: str) -> str:\n    """Remove one blank line below a Google-style parameter section title.\n\n    Griffe skips a recognized section when its title is followed by one blank line and then\n    an indented body, reporting ``Extraneous blank line below section title``. Normalize only\n    the parameter-section aliases consumed by ``generate_func_documentation``; unrelated Google\n    sections and already well-formed docstrings are left unchanged.\n    """\n    lines = doc.splitlines()\n    output: list[str] = []\n    removed = False\n    index = 0\n    while index < len(lines):\n        line = lines[index]\n        output.append(line)\n        if (\n            _GOOGLE_SECTION_HEADER_RE.match(line)\n            and index + 2 < len(lines)\n            and not lines[index + 1].strip()\n            and lines[index + 2].startswith((" ", "\\t"))\n        ):\n            index += 1\n            removed = True\n        index += 1\n\n    if not removed:\n        return doc\n    return "\\n".join(output)\n\n\ndef generate_func_documentation(\n'''
+          if marker not in source:
+              raise SystemExit("source insertion marker not found")
+          source = source.replace(marker, helper, 1)
+
+          old_call = '''    if resolved_style == "google":\n        doc = _ensure_blank_line_before_google_sections(doc)\n'''
+          new_call = '''    if resolved_style == "google":\n        doc = _ensure_blank_line_before_google_sections(doc)\n        doc = _remove_blank_line_after_google_sections(doc)\n'''
+          if old_call not in source:
+              raise SystemExit("normalization call marker not found")
+          source = source.replace(old_call, new_call, 1)
+          source_path.write_text(source)
+
+          test_path = Path("tests/test_function_schema.py")
+          tests = test_path.read_text()
+          addition = r'''
+
+
+def blank_line_below_args_google_function(city: str, units: str):
+    """Get the weather for a city.
+
+    Args:
+
+        city: The city to get weather for.
+        units: Temperature units to use.
+    """
+    return f"{city} {units}"
+
+
+def test_google_docstring_blank_line_below_args():
+    fs = function_schema(blank_line_below_args_google_function, strict_json_schema=False)
+
+    properties = fs.params_json_schema.get("properties", {})
+    assert properties["city"]["description"] == "The city to get weather for."
+    assert properties["units"]["description"] == "Temperature units to use."
+    assert fs.description == "Get the weather for a city."
+    assert "Args:" not in (fs.description or "")
+
+
+@pytest.mark.parametrize("section_name", ["Args", "Arguments", "Params", "Parameters"])
+def test_google_docstring_blank_line_below_parameter_alias(section_name: str):
+    def documented(value: str) -> str:
+        return value
+
+    documented.__doc__ = (
+        "Describe the value.\n\n"
+        f"{section_name}:\n\n"
+        "    value: The value to return."
+    )
+
+    doc = generate_func_documentation(documented, style="google")
+
+    assert doc.description == "Describe the value."
+    assert doc.param_descriptions == {"value": "The value to return."}
+'''
+          if "def test_google_docstring_blank_line_below_args():" not in tests:
+              test_path.write_text(tests.rstrip() + addition + "\n")
+
+      - name: Run focused tests
+        run: uv run --frozen pytest tests/test_function_schema.py -q -k 'google_docstring_blank_line_below'
+      - name: Format and lint changed files
+        run: |
+          uv run --frozen ruff format src/agents/function_schema.py tests/test_function_schema.py
+          uv run --frozen ruff check src/agents/function_schema.py tests/test_function_schema.py
+      - name: Commit patch
+        run: |
+          git config user.name "Sylvester Kaczmarek"
+          git config user.email "16242628+sylvesterkaczmarek@users.noreply.github.com"
+          git add src/agents/function_schema.py tests/test_function_schema.py
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "fix(tools): parse Google Args blocks with extra blank line"
+          git push
